@@ -1,0 +1,60 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment and credentials
+.env
+.env.*
+kaggle.json
+
+# Kaggle / BirdCLEF data
+data/
+*.ogg
+*.wav
+*.flac
+*.mp3
+
+# Training outputs and model artifacts
+outputs/
+checkpoints/
+wandb/
+runs/
+logs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tflite
+
+# Generated submissions and prediction dumps
+submission.csv
+submissions/
+predictions/
+oof/
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.parquet
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
