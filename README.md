@@ -27,4 +27,14 @@ python train.py --data-dir data/birdclef-2026 --meta-dir data/processed --out-di
 python infer.py --data-dir data/birdclef-2026 --checkpoint outputs/exp001/fold0_best.pt --out submission.csv
 ```
 
+## Stronger Local Training Recipe
+
+For an RTX 3060 Laptop GPU, start with EfficientNetV2-S plus in-domain soundscapes, mixup, SpecAugment, EMA, and cosine LR scheduling:
+
+```bash
+python train.py --data-dir data/birdclef-2026 --meta-dir data/processed --out-dir outputs/effv2s_fold0 --model tf_efficientnetv2_s.in21k_ft_in1k --epochs 12 --fold 0 --batch-size 8 --grad-accum 2 --duration 10 --channels-last --include-soundscapes --pooling gem --head-hidden 512 --drop-path 0.1 --mixup-alpha 0.3 --mixup-p 0.5 --spec-augment-p 0.5 --scheduler cosine
+```
+
+If memory is still comfortable, try `--batch-size 12 --grad-accum 1` or `--batch-size 16 --grad-accum 1`. Keep the final Kaggle inference model small enough to finish CPU scoring within 90 minutes; one EfficientNetV2-S fold is a reasonable first stronger submission.
+
 On Kaggle, attach the competition dataset and your trained weights dataset, then run `infer.py` from a notebook or paste its cells into a Kaggle Code notebook.

@@ -72,7 +72,15 @@ def main() -> None:
     for ckpt_path in args.checkpoint:
         ckpt = torch.load(ckpt_path, map_location=device)
         model_name = args.model or ckpt.get("model_name", "tf_efficientnet_b0_ns")
-        model = BirdCLEFModel(model_name, num_classes=len(species), pretrained=False, dropout=float(ckpt.get("dropout", 0.2))).to(device)
+        model = BirdCLEFModel(
+            model_name,
+            num_classes=len(species),
+            pretrained=False,
+            dropout=float(ckpt.get("dropout", 0.2)),
+            pooling=str(ckpt.get("pooling", "avg")),
+            head_hidden=int(ckpt.get("head_hidden", 0)),
+            drop_path_rate=float(ckpt.get("drop_path", 0.0)),
+        ).to(device)
         load_checkpoint(model, str(ckpt_path), device)
         model.eval()
         models.append(model)

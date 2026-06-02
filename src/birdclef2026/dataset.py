@@ -17,12 +17,22 @@ class BirdCLEFDataset(Dataset):
         sample_rate: int = 32000,
         duration: float = 10.0,
         train: bool = True,
+        spec_augment_p: float = 0.0,
+        time_masks: int = 2,
+        freq_masks: int = 2,
+        time_mask_width: int = 48,
+        freq_mask_width: int = 16,
     ) -> None:
         self.df = pd.read_csv(manifest) if not isinstance(manifest, pd.DataFrame) else manifest.copy()
         self.sample_rate = sample_rate
         self.num_samples = int(sample_rate * duration)
         self.train = train
         self.extractor = LogMelExtractor(sample_rate=sample_rate)
+        self.spec_augment_p = spec_augment_p
+        self.time_masks = time_masks
+        self.freq_masks = freq_masks
+        self.time_mask_width = time_mask_width
+        self.freq_mask_width = freq_mask_width
         self.target_cols = [c for c in self.df.columns if c.startswith("target_")]
         if not self.target_cols:
             raise ValueError("Manifest must contain target_0 ... target_N columns.")
@@ -49,5 +59,22 @@ class BirdCLEFDataset(Dataset):
 
         waveform = torch.from_numpy(audio)
         spec = self.extractor(waveform)
+        if self.train and self.spec_augment_p > 0 and rng.random() < self.spec_augment_p:
+            spec = self._spec_augment(spec, rng)
         target = torch.tensor(row[self.target_cols].to_numpy(dtype=np.float32), dtype=torch.float32)
         return spec, target
+
+    def _spec_augment(self, spec: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
+        spec = spec.clone()
+        _, n_mels, n_frames = spec.shape
+        for _ in range(self.freq_masks):
+            width = int(rng.integers(0, min(self.freq_mask_width, n_mels) + 1))
+            if width > 0:
+                start = int(rng.integers(0, n_mels - width + 1))
+                spec[:, start : start + width, :] = 0.0
+        for _ in range(self.time_masks):
+            width = int(rng.integers(0, min(self.time_mask_width, n_frames) + 1))
+            if width > 0:
+                start = int(rng.integers(0, n_frames - width + 1))
+                spec[:, :, start : start + width] = 0.0
+        return spec

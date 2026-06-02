@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import math
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import roc_auc_score
@@ -18,6 +21,33 @@ from birdclef2026.dataset import BirdCLEFDataset
 from birdclef2026.losses import AsymmetricLoss
 from birdclef2026.model import BirdCLEFModel
 from birdclef2026.utils import load_json
+
+
+class ModelEma:
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999) -> None:
+        self.module = copy.deepcopy(model).eval()
+        self.decay = decay
+        for param in self.module.parameters():
+            param.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        model_state = model.state_dict()
+        ema_state = self.module.state_dict()
+        for name, ema_value in ema_state.items():
+            model_value = model_state[name].detach()
+            if ema_value.dtype.is_floating_point:
+                ema_value.mul_(self.decay).add_(model_value, alpha=1.0 - self.decay)
+            else:
+                ema_value.copy_(model_value)
+
+
+def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float, p: float) -> tuple[torch.Tensor, torch.Tensor]:
+    if alpha <= 0 or p <= 0 or x.size(0) < 2 or np.random.random() > p:
+        return x, y
+    lam = float(np.random.beta(alpha, alpha))
+    index = torch.randperm(x.size(0), device=x.device)
+    return x * lam + x[index] * (1.0 - lam), y * lam + y[index] * (1.0 - lam)
 
 
 def evaluate(model, loader, device, target_threshold: float = 0.0):
@@ -43,15 +73,29 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--meta-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/exp001"))
-    parser.add_argument("--model", default="tf_efficientnet_b0_ns")
+    parser.add_argument("--model", default="tf_efficientnetv2_s.in21k_ft_in1k")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps for small VRAM GPUs.")
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--duration", type=float, default=8.0)
     parser.add_argument("--loss", choices=["bce", "asymmetric"], default="asymmetric")
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--pooling", choices=["avg", "max", "avgmax", "gem"], default="gem")
+    parser.add_argument("--head-hidden", type=int, default=512)
+    parser.add_argument("--drop-path", type=float, default=0.1)
+    parser.add_argument("--mixup-alpha", type=float, default=0.3)
+    parser.add_argument("--mixup-p", type=float, default=0.5)
+    parser.add_argument("--spec-augment-p", type=float, default=0.5)
+    parser.add_argument("--time-mask-width", type=int, default=48)
+    parser.add_argument("--freq-mask-width", type=int, default=16)
+    parser.add_argument("--scheduler", choices=["none", "cosine", "onecycle"], default="cosine")
+    parser.add_argument("--min-lr", type=float, default=1e-6)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--no-ema", action="store_true")
+    parser.add_argument("--clip-grad", type=float, default=1.0)
     parser.add_argument("--eval-target-threshold", type=float, default=0.0, help="Binarize soft labels before ROC-AUC.")
     parser.add_argument("--include-soundscapes", action="store_true", help="Add labeled 5-second soundscape rows to the training split.")
     parser.add_argument("--num-workers", type=int, default=2)
@@ -71,27 +115,70 @@ def main() -> None:
         train_df = pd.concat([train_df, sound_df], ignore_index=True)
         print(f"Added labeled soundscape rows to training: {len(sound_df)}")
 
-    train_ds = BirdCLEFDataset(train_df, duration=args.duration, train=True)
+    train_ds = BirdCLEFDataset(
+        train_df,
+        duration=args.duration,
+        train=True,
+        spec_augment_p=args.spec_augment_p,
+        time_mask_width=args.time_mask_width,
+        freq_mask_width=args.freq_mask_width,
+    )
     valid_ds = BirdCLEFDataset(valid_df, duration=5.0, train=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pin_memory = device.type == "cuda"
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=pin_memory)
-    valid_loader = DataLoader(valid_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=pin_memory)
+    persistent_workers = args.num_workers > 0
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+    )
+    valid_loader = DataLoader(
+        valid_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+    )
 
-    model = BirdCLEFModel(args.model, num_classes=len(species), pretrained=True, dropout=args.dropout).to(device)
+    model = BirdCLEFModel(
+        args.model,
+        num_classes=len(species),
+        pretrained=True,
+        dropout=args.dropout,
+        pooling=args.pooling,
+        head_hidden=args.head_hidden,
+        drop_path_rate=args.drop_path,
+    ).to(device)
     if args.channels_last and device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
     criterion = AsymmetricLoss() if args.loss == "asymmetric" else torch.nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     use_amp = device.type == "cuda" and not args.no_amp
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
     grad_accum = max(1, args.grad_accum)
+    optimizer_steps_per_epoch = math.ceil(len(train_loader) / grad_accum)
+    total_optimizer_steps = max(1, optimizer_steps_per_epoch * args.epochs)
+    scheduler = None
+    if args.scheduler == "onecycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, total_steps=total_optimizer_steps)
+    elif args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_optimizer_steps, eta_min=args.min_lr)
+    ema = None if args.no_ema else ModelEma(model, decay=args.ema_decay)
     if device.type == "cuda":
         print(f"Using GPU: {torch.cuda.get_device_name(0)}")
         print(f"CUDA runtime visible to PyTorch: {torch.version.cuda}")
     else:
         print("CUDA is not available to PyTorch; training will run on CPU.")
-    print(f"batch_size={args.batch_size} grad_accum={grad_accum} effective_batch={args.batch_size * grad_accum} amp={use_amp}")
+    print(
+        f"model={args.model} pooling={args.pooling} head_hidden={args.head_hidden} "
+        f"batch_size={args.batch_size} grad_accum={grad_accum} effective_batch={args.batch_size * grad_accum} "
+        f"amp={use_amp} mixup={args.mixup_alpha}/{args.mixup_p} specaug={args.spec_augment_p} "
+        f"scheduler={args.scheduler} ema={ema is not None}"
+    )
 
     best_auc = -1.0
     for epoch in range(1, args.epochs + 1):
@@ -102,25 +189,39 @@ def main() -> None:
             x, y = x.to(device), y.to(device)
             if args.channels_last and device.type == "cuda":
                 x = x.contiguous(memory_format=torch.channels_last)
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            x, y = mixup_batch(x, y, alpha=args.mixup_alpha, p=args.mixup_p)
+            with torch.amp.autocast(device.type, enabled=use_amp):
                 logits = model(x)
                 loss = criterion(logits, y) / grad_accum
             scaler.scale(loss).backward()
             if step % grad_accum == 0 or step == len(train_loader):
+                if args.clip_grad > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                if scheduler is not None:
+                    scheduler.step()
+                if ema is not None:
+                    ema.update(model)
             total_loss += float(loss.detach().cpu()) * grad_accum
 
-        auc = evaluate(model, valid_loader, device, target_threshold=args.eval_target_threshold)
-        print(f"epoch={epoch} train_loss={total_loss / max(1, len(train_loader)):.5f} val_macro_auc={auc:.5f}")
+        eval_model = ema.module if ema is not None else model
+        auc = evaluate(eval_model, valid_loader, device, target_threshold=args.eval_target_threshold)
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"epoch={epoch} train_loss={total_loss / max(1, len(train_loader)):.5f} val_macro_auc={auc:.5f} lr={current_lr:.2e}")
         ckpt = {
-            "model": model.state_dict(),
+            "model": eval_model.state_dict(),
             "species": species,
             "model_name": args.model,
             "fold": args.fold,
             "auc": auc,
             "dropout": args.dropout,
+            "pooling": args.pooling,
+            "head_hidden": args.head_hidden,
+            "drop_path": args.drop_path,
+            "duration": args.duration,
         }
         torch.save(ckpt, args.out_dir / f"fold{args.fold}_last.pt")
         if auc > best_auc:
