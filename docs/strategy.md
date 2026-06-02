@@ -51,23 +51,26 @@ The starter parser does this:
 - Creates stratified folds on primary labels for focal recordings, with a group fallback if metadata columns exist.
 - Leaves soundscape labels available as a separate in-domain fine-tuning manifest.
 
-## Baseline Model
+## Current Anchor Model
 
-The included model is a Kaggle-friendly mel-spectrogram image classifier:
+The current anchor is no longer just a plain mel-spectrogram classifier. It is a compact PyTorch model intended to work as a reliable Kaggle CPU anchor while leaving room for Perch/BirdNET-style sidecars:
 
 - Audio sample rate: 32 kHz.
 - Training window: default 10 seconds for focal clips.
 - Inference window: exact 5 seconds.
-- Spectrogram: 128 mel bins, 20-16,000 Hz, log compression.
-- Backbone: `timm` EfficientNet/ConvNeXt/Swin-style 2D model with `in_chans=1`.
+- Spectrogram: 128 mel bins, 20-16,000 Hz, with `logmel`, `pcen`, or two-channel `logmel_pcen`.
+- Backbone: `timm` EfficientNet/ConvNeXt/Swin-style 2D model with `in_chans` loaded from the checkpoint.
+- Pooling: `attn` by default, which combines event-weighted spatial features and peak features.
 - Head: 234 sigmoid logits.
 - Loss: BCEWithLogits or AsymmetricLoss.
+- Training extras: EMA, mixup, SpecAugment, in-domain soundscape rows, and rare-class balanced sampling.
+- Inference extras: logit averaging, optional sidecar CSV rank correction, taxonomy smoothing, and temporal smoothing.
 
 Good starting configs:
 
 ```bash
-python train.py --model tf_efficientnet_b0_ns --epochs 10 --batch-size 32
-python train.py --model tf_efficientnetv2_s.in21k_ft_in1k --epochs 12 --batch-size 16 --loss asymmetric
+python train.py --data-dir data/birdclef-2026 --meta-dir data/processed --out-dir outputs/anchor_v2_small_fold0 --model tf_efficientnet_b0_ns --epochs 10 --fold 0 --batch-size 8 --grad-accum 2 --duration 8 --include-soundscapes --spec-mode logmel_pcen --pooling attn --head-hidden 256 --balanced-sampler
+python train.py --data-dir data/birdclef-2026 --meta-dir data/processed --out-dir outputs/anchor_v2_fold0 --model convnext_tiny.fb_in22k_ft_in1k --epochs 12 --fold 0 --batch-size 8 --grad-accum 2 --duration 10 --channels-last --include-soundscapes --spec-mode logmel_pcen --pooling attn --head-hidden 512 --drop-path 0.1 --balanced-sampler --scheduler cosine
 ```
 
 ## High-Score Roadmap
@@ -87,10 +90,13 @@ python train.py --model tf_efficientnetv2_s.in21k_ft_in1k --epochs 12 --batch-si
 5. Pseudo-label soundscapes:
    Train teacher models, predict unlabeled train soundscapes, keep confident soft labels, and train a student. Average logits, not thresholded labels.
 
-6. Ensemble within CPU budget:
-   Start with 2 folds, profile CPU inference, then add folds/backbones only if still under 90 minutes. Logit averaging is the default.
+6. Ensemble and sidecars within CPU budget:
+   Start with 1-2 folds. If a public Perch/BirdNET/SED sidecar already produces a valid submission CSV, blend it through `infer.py --sidecar-csv ... --sidecar-rank-blend` instead of blindly averaging probabilities. Rank correction with top-k masks is safer for macro AUC.
 
-7. Export for speed:
+7. Taxonomy and temporal post-processing:
+   Use small values first: `--tax-genus-alpha 0.15 --tax-class-alpha 0.05 --temporal-smooth-alpha 0.15`. These are weak priors, not a replacement for model predictions.
+
+8. Export for speed:
    ONNX Runtime or TFLite can be 2-10x faster depending on model. Keep pure PyTorch as the reliable fallback.
 
 ## Kaggle Submission Workflow

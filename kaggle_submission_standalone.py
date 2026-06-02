@@ -15,17 +15,24 @@ from torch import nn
 from tqdm import tqdm
 
 
-# Paste this whole file into one Kaggle Notebook cell, or run it as a script.
-# If CHECKPOINT_PATHS is empty, the script searches /kaggle/input for fold*_best.pt,
-# then falls back to every .pt/.pth/.ckpt file it can find.
 DATA_DIR = Path("/kaggle/input/birdclef-2026")
 OUT_PATH = Path("/kaggle/working/submission.csv")
 CHECKPOINT_PATHS: list[str] = []
+SIDECAR_CSV_PATHS: list[str] = []
+SIDECAR_WEIGHTS: list[float] = []
+
 SAMPLE_RATE = 32000
 WINDOW_SECONDS = 5
-BATCH_SIZE = 32
+BATCH_SIZE = 24
 TTA = 0
 NUM_THREADS = max(1, min(4, os.cpu_count() or 2))
+
+SIDECAR_RANK_BLEND = True
+SIDECAR_TOPK = 48
+SIDECAR_BUDGET = 0.006
+TAX_GENUS_ALPHA = 0.15
+TAX_CLASS_ALPHA = 0.05
+TEMPORAL_SMOOTH_ALPHA = 0.15
 
 
 def sigmoid(x: np.ndarray) -> np.ndarray:
@@ -73,8 +80,12 @@ class LogMelExtractor(torch.nn.Module):
         n_mels: int = 128,
         f_min: int = 20,
         f_max: int = 16000,
+        mode: str = "logmel",
     ) -> None:
         super().__init__()
+        if mode not in {"logmel", "pcen", "logmel_pcen"}:
+            raise ValueError(f"Unknown spectrogram mode: {mode}")
+        self.mode = mode
         self.mel = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate,
             n_fft=n_fft,
@@ -88,12 +99,40 @@ class LogMelExtractor(torch.nn.Module):
         self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80)
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+        batched = waveform.ndim == 2
         if waveform.ndim == 1:
             waveform = waveform.unsqueeze(0)
-        spec = self.mel(waveform)
-        spec = self.amplitude_to_db(spec)
-        spec = (spec + 80.0) / 80.0
-        return spec.clamp(0.0, 1.0)
+        power = self.mel(waveform)
+        logmel = self.amplitude_to_db(power)
+        logmel = ((logmel + 80.0) / 80.0).clamp(0.0, 1.0)
+        if batched:
+            logmel = logmel.unsqueeze(1)
+        if self.mode == "logmel":
+            return logmel
+        pcen = self._pcen(power)
+        if batched:
+            pcen = pcen.unsqueeze(1)
+        if self.mode == "pcen":
+            return pcen
+        return torch.cat([logmel, pcen], dim=1)
+
+    @staticmethod
+    def _pcen(
+        power: torch.Tensor,
+        gain: float = 0.98,
+        bias: float = 2.0,
+        power_exp: float = 0.5,
+        smooth: float = 0.025,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        smoother = torch.zeros_like(power)
+        smoother[..., 0] = power[..., 0]
+        for t in range(1, power.shape[-1]):
+            smoother[..., t] = (1.0 - smooth) * smoother[..., t - 1] + smooth * power[..., t]
+        pcen = (power / (eps + smoother).pow(gain) + bias).pow(power_exp) - bias**power_exp
+        pcen_min = pcen.amin(dim=(-2, -1), keepdim=True)
+        pcen_max = pcen.amax(dim=(-2, -1), keepdim=True)
+        return ((pcen - pcen_min) / (pcen_max - pcen_min + eps)).clamp(0.0, 1.0)
 
 
 class GeM(nn.Module):
@@ -113,12 +152,14 @@ class GeM(nn.Module):
 class FeaturePool(nn.Module):
     def __init__(self, pooling: str = "avg") -> None:
         super().__init__()
+        if pooling not in {"avg", "max", "avgmax", "gem", "attn"}:
+            raise ValueError(f"Unknown pooling: {pooling}")
         self.pooling = pooling
         self.gem = GeM()
 
     @property
     def feature_multiplier(self) -> int:
-        return 2 if self.pooling == "avgmax" else 1
+        return 2 if self.pooling in {"avgmax", "attn"} else 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim <= 2:
@@ -127,6 +168,12 @@ class FeaturePool(nn.Module):
             return self.gem(x)
         if x.ndim == 4:
             avg = F.adaptive_avg_pool2d(x, 1).flatten(1)
+            if self.pooling == "attn":
+                b, _, h, w = x.shape
+                attn = torch.softmax(x.mean(dim=1).flatten(1), dim=1).view(b, 1, h, w)
+                weighted = (x * attn).sum(dim=(-2, -1))
+                peak = F.adaptive_max_pool2d(x, 1).flatten(1)
+                return torch.cat([weighted, peak], dim=1)
             if self.pooling == "max":
                 return F.adaptive_max_pool2d(x, 1).flatten(1)
             if self.pooling == "avgmax":
@@ -150,6 +197,7 @@ class BirdCLEFModel(nn.Module):
         pooling: str = "avg",
         head_hidden: int = 0,
         drop_path_rate: float = 0.0,
+        in_chans: int = 1,
     ) -> None:
         super().__init__()
         try:
@@ -163,7 +211,7 @@ class BirdCLEFModel(nn.Module):
             self.backbone = timm.create_model(
                 model_name,
                 pretrained=pretrained,
-                in_chans=1,
+                in_chans=in_chans,
                 num_classes=0,
                 global_pool="",
                 **model_kwargs,
@@ -172,7 +220,7 @@ class BirdCLEFModel(nn.Module):
             self.backbone = timm.create_model(
                 model_name,
                 pretrained=pretrained,
-                in_chans=1,
+                in_chans=in_chans,
                 num_classes=0,
                 global_pool="",
             )
@@ -188,10 +236,7 @@ class BirdCLEFModel(nn.Module):
                 nn.Linear(head_hidden, num_classes),
             )
         else:
-            self.head = nn.Sequential(
-                nn.Dropout(p=dropout),
-                nn.Linear(head_in, num_classes),
-            )
+            self.head = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(head_in, num_classes))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.pool(self.backbone(x)))
@@ -215,12 +260,15 @@ def discover_checkpoints() -> list[Path]:
     return sorted(candidates)
 
 
-def load_models(checkpoint_paths: Iterable[Path], num_classes: int, device: torch.device) -> list[nn.Module]:
+def load_models(checkpoint_paths: Iterable[Path], num_classes: int, device: torch.device) -> tuple[list[nn.Module], str]:
     models = []
+    spec_modes = []
     for ckpt_path in checkpoint_paths:
         ckpt = torch.load(ckpt_path, map_location=device)
         state = ckpt.get("model", ckpt)
         model_name = ckpt.get("model_name", "tf_efficientnet_b0_ns") if isinstance(ckpt, dict) else "tf_efficientnet_b0_ns"
+        spec_mode = str(ckpt.get("spec_mode", "logmel")) if isinstance(ckpt, dict) else "logmel"
+        in_chans = int(ckpt.get("in_chans", 2 if spec_mode == "logmel_pcen" else 1)) if isinstance(ckpt, dict) else 1
         model = BirdCLEFModel(
             model_name=model_name,
             num_classes=num_classes,
@@ -229,14 +277,18 @@ def load_models(checkpoint_paths: Iterable[Path], num_classes: int, device: torc
             pooling=str(ckpt.get("pooling", "avg")) if isinstance(ckpt, dict) else "avg",
             head_hidden=int(ckpt.get("head_hidden", 0)) if isinstance(ckpt, dict) else 0,
             drop_path_rate=float(ckpt.get("drop_path", 0.0)) if isinstance(ckpt, dict) else 0.0,
+            in_chans=in_chans,
         )
         model.load_state_dict(state, strict=True)
         model.to(device).eval()
         models.append(model)
-        print(f"Loaded {ckpt_path.name}: model={model_name}")
+        spec_modes.append(spec_mode)
+        print(f"Loaded {ckpt_path.name}: model={model_name} spec_mode={spec_mode} pooling={model.pool.pooling}")
     if not models:
         raise FileNotFoundError("No checkpoint found. Set CHECKPOINT_PATHS near the top of this cell.")
-    return models
+    if len(set(spec_modes)) > 1:
+        raise ValueError(f"Checkpoint ensemble uses mixed spec modes: {sorted(set(spec_modes))}")
+    return models, spec_modes[0]
 
 
 def make_variants(clips: np.ndarray, tta: int) -> list[np.ndarray]:
@@ -282,6 +334,90 @@ def build_audio_clips(audio: np.ndarray, end_seconds: list[int], sample_rate: in
     return np.stack(clips).astype(np.float32)
 
 
+def percentile_rank(values: np.ndarray) -> np.ndarray:
+    order = np.argsort(values, axis=0)
+    ranks = np.empty_like(values, dtype=np.float32)
+    scale = max(1, values.shape[0] - 1)
+    for col in range(values.shape[1]):
+        ranks[order[:, col], col] = np.arange(values.shape[0], dtype=np.float32) / scale
+    return ranks
+
+
+def blend_sidecar_csv(anchor: pd.DataFrame, sidecar_path: Path, species: list[str], weight: float) -> pd.DataFrame:
+    side = pd.read_csv(sidecar_path).set_index("row_id").reindex(anchor["row_id"].astype(str)).reset_index()
+    missing = [c for c in species if c not in side.columns]
+    if missing:
+        raise ValueError(f"{sidecar_path} missing species columns, first={missing[:5]}")
+    base = anchor[species].to_numpy(dtype=np.float32)
+    extra = side[species].fillna(0.0).to_numpy(dtype=np.float32)
+    base_blend = percentile_rank(base) if SIDECAR_RANK_BLEND else base
+    extra_blend = percentile_rank(extra) if SIDECAR_RANK_BLEND else extra
+    mask = np.ones_like(base_blend, dtype=bool)
+    if 0 < SIDECAR_TOPK < len(species):
+        mask = np.zeros_like(base_blend, dtype=bool)
+        rows = np.arange(base_blend.shape[0])[:, None]
+        mask[rows, np.argpartition(base_blend, -SIDECAR_TOPK, axis=1)[:, -SIDECAR_TOPK:]] = True
+        mask[rows, np.argpartition(extra_blend, -SIDECAR_TOPK, axis=1)[:, -SIDECAR_TOPK:]] = True
+    delta = np.where(mask, extra_blend - base_blend, 0.0)
+    movement = float(np.mean(np.abs(weight * delta)))
+    if SIDECAR_BUDGET > 0 and movement > SIDECAR_BUDGET:
+        weight *= SIDECAR_BUDGET / max(movement, 1e-8)
+        print(f"Shrunk sidecar {sidecar_path.name}: movement={movement:.6f} new_weight={weight:.5f}")
+    out = anchor.copy()
+    out[species] = np.clip(base_blend + weight * delta, 0.0, 1.0)
+    return out
+
+
+def apply_taxonomy_smoothing(df: pd.DataFrame, taxonomy_path: Path, species: list[str]) -> pd.DataFrame:
+    if TAX_GENUS_ALPHA <= 0 and TAX_CLASS_ALPHA <= 0:
+        return df
+    if not taxonomy_path.exists():
+        print("taxonomy.csv not found; smoothing skipped.")
+        return df
+    taxonomy = pd.read_csv(taxonomy_path)
+    if "primary_label" not in taxonomy.columns:
+        return df
+    taxonomy = taxonomy.set_index("primary_label").reindex(species).reset_index()
+    genus_col = next((c for c in ["genus", "genus_name"] if c in taxonomy.columns), None)
+    class_col = next((c for c in ["class", "class_name", "category", "taxon_class"] if c in taxonomy.columns), None)
+    if genus_col is None and "scientific_name" in taxonomy.columns:
+        taxonomy["__genus"] = taxonomy["scientific_name"].astype(str).str.split().str[0]
+        genus_col = "__genus"
+    values = df[species].to_numpy(dtype=np.float32)
+    for col, alpha in [(genus_col, TAX_GENUS_ALPHA), (class_col, TAX_CLASS_ALPHA)]:
+        if col is None or alpha <= 0:
+            continue
+        groups = taxonomy[col].fillna("").astype(str).to_numpy()
+        shared = values.copy()
+        for group in sorted(set(groups)):
+            idx = np.where(groups == group)[0]
+            if group and len(idx) > 1:
+                shared[:, idx] = values[:, idx].mean(axis=1, keepdims=True)
+        values = (1.0 - alpha) * values + alpha * shared
+    out = df.copy()
+    out[species] = np.clip(values, 0.0, 1.0)
+    return out
+
+
+def apply_temporal_smoothing(df: pd.DataFrame, species: list[str]) -> pd.DataFrame:
+    if TEMPORAL_SMOOTH_ALPHA <= 0:
+        return df
+    out = df.copy()
+    values = out[species].to_numpy(dtype=np.float32)
+    audio_ids = out["row_id"].astype(str).map(lambda x: x.rsplit("_", 1)[0])
+    for _, idx in out.groupby(audio_ids, sort=False).groups.items():
+        order = list(idx)
+        if len(order) <= 1:
+            continue
+        series = values[order].copy()
+        smooth = series.copy()
+        for i in range(1, len(order)):
+            smooth[i] = (1.0 - TEMPORAL_SMOOTH_ALPHA) * series[i] + TEMPORAL_SMOOTH_ALPHA * smooth[i - 1]
+        values[order] = smooth
+    out[species] = np.clip(values, 0.0, 1.0)
+    return out
+
+
 def main() -> None:
     torch.set_num_threads(NUM_THREADS)
     sample_path = DATA_DIR / "sample_submission.csv"
@@ -292,9 +428,9 @@ def main() -> None:
     print("Checkpoints:")
     for path in checkpoints:
         print(f"  {path}")
-    models = load_models(checkpoints, num_classes=len(species), device=device)
+    models, spec_mode = load_models(checkpoints, num_classes=len(species), device=device)
+    extractor = LogMelExtractor(sample_rate=SAMPLE_RATE, mode=spec_mode).to(device).eval()
 
-    extractor = LogMelExtractor(sample_rate=SAMPLE_RATE).to(device).eval()
     grouped: dict[str, list[tuple[str, int]]] = {}
     for row_id in sample["row_id"].astype(str):
         audio_id, end_s = parse_row_id(row_id)
@@ -311,7 +447,6 @@ def main() -> None:
             for row_id, _ in rows:
                 predictions[row_id] = np.zeros(len(species), dtype=np.float32)
             continue
-
         audio = load_audio(path, sample_rate=SAMPLE_RATE)
         row_ids = [row_id for row_id, _ in rows]
         end_seconds = [end_s for _, end_s in rows]
@@ -321,8 +456,13 @@ def main() -> None:
             predictions[row_id] = prob
 
     pred_mat = np.vstack([predictions.get(str(row_id), np.zeros(len(species), dtype=np.float32)) for row_id in sample["row_id"]])
-    pred_df = pd.DataFrame(pred_mat, columns=species)
-    sub = pd.concat([sample[["row_id"]].copy(), pred_df], axis=1)
+    sub = pd.concat([sample[["row_id"]].copy(), pd.DataFrame(pred_mat, columns=species)], axis=1)
+    sub = sub[sample.columns]
+    for i, sidecar in enumerate(SIDECAR_CSV_PATHS):
+        weight = SIDECAR_WEIGHTS[i] if i < len(SIDECAR_WEIGHTS) else 0.03
+        sub = blend_sidecar_csv(sub, Path(sidecar), species=species, weight=weight)
+    sub = apply_taxonomy_smoothing(sub, DATA_DIR / "taxonomy.csv", species)
+    sub = apply_temporal_smoothing(sub, species)
     sub = sub[sample.columns]
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     sub.to_csv(OUT_PATH, index=False)

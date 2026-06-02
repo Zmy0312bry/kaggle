@@ -1,110 +1,72 @@
 # BirdCLEF+ 2026 Kaggle 提交指南
 
-这份指南用于把本地训练好的模型提交到 Kaggle Code Competition。最终目标是在 Kaggle Notebook 里生成：
+最终目标是在 Kaggle Code Notebook 中生成：
 
 ```text
 /kaggle/working/submission.csv
 ```
 
-## 1. 本地准备
+## 1. 要上传的文件
 
-先确认本地至少有一个训练好的权重，例如：
-
-```text
-D:\kaggle\birdclef2026\outputs\effv2s_fold0\fold0_best.pt
-```
-
-如果你还在用第一个 baseline，也可以是：
-
-```text
-D:\kaggle\birdclef2026\outputs\exp001\fold0_best.pt
-```
-
-同时确认这个单文件提交脚本存在：
-
-```text
-D:\kaggle\birdclef2026\kaggle_submission_standalone.py
-```
-
-这个脚本已经把 `audio.py`、`model.py`、`utils.py`、`infer.py` 的核心内容合并到一个文件里。Kaggle 上不需要再额外复制 `src/` 目录。
-
-## 2. 创建 Kaggle Dataset
-
-在 Kaggle 网页操作：
-
-1. 点击右上角 `Create`
-2. 选择 `New Dataset`
-3. 上传以下文件：
+创建一个 Kaggle Dataset，例如 `birdclef2026-weights`，上传：
 
 ```text
 kaggle_submission_standalone.py
 fold0_best.pt
 ```
 
-如果你训练了多个 fold，可以一起上传：
+如果训练了多折，可以一起上传：
 
 ```text
 fold0_best.pt
 fold1_best.pt
 fold2_best.pt
-...
 ```
 
-Dataset 名字可以叫：
+如果有 Perch、BirdNET 或其他公开模型生成的 sidecar submission，也可以上传：
 
 ```text
-birdclef2026-weights
+subm_birdnet_v24.csv
+subm_perch.csv
 ```
 
-## 3. 创建提交 Notebook
+## 2. standalone 脚本包含什么
 
-新建一个 Kaggle Notebook，然后添加两个 Input：
+`kaggle_submission_standalone.py` 已经合并了新版核心逻辑：
 
-1. 官方比赛数据集：`birdclef-2026`
-2. 你的权重数据集：`birdclef2026-weights`
+- `logmel`、`pcen`、`logmel_pcen`
+- 双通道 checkpoint 自动识别
+- `attn` pooling
+- 多 checkpoint logit ensemble
+- sidecar CSV rank-space blending
+- taxonomy smoothing
+- temporal smoothing
 
-Notebook 设置里建议：
+所以 Kaggle 上不需要再复制 `src/` 目录。
+
+## 3. Kaggle Notebook 设置
+
+新建 Notebook，Add Input：
+
+- 官方比赛数据：`birdclef-2026`
+- 你的权重 Dataset：例如 `birdclef2026-weights`
+
+设置：
 
 ```text
 Accelerator: None
 Internet: Off
 ```
 
-比赛最终评分是 CPU 离线运行，所以提交前一定要用这个环境检查。
-
-## 4. 推荐运行方式
-
-如果你把 `kaggle_submission_standalone.py` 也上传到了 Dataset，在 Notebook 第一格运行：
+运行：
 
 ```python
 !python /kaggle/input/birdclef2026-weights/kaggle_submission_standalone.py
 ```
 
-脚本会自动在 `/kaggle/input` 下面寻找：
+## 4. 手动指定权重
 
-```text
-fold*_best.pt
-```
-
-如果找不到，才会退而寻找其他 `.pt`、`.pth`、`.ckpt` 文件。
-
-## 5. 直接粘贴方式
-
-如果你不想通过 `!python` 运行，也可以打开本地文件：
-
-```text
-D:\kaggle\birdclef2026\kaggle_submission_standalone.py
-```
-
-把里面全部代码复制到 Kaggle Notebook 的一个 cell 里，然后直接运行。
-
-如果自动找权重找错了，就修改脚本顶部：
-
-```python
-CHECKPOINT_PATHS: list[str] = []
-```
-
-改成你的权重路径，例如：
+如果自动搜索权重不符合预期，改脚本顶部：
 
 ```python
 CHECKPOINT_PATHS = [
@@ -112,7 +74,7 @@ CHECKPOINT_PATHS = [
 ]
 ```
 
-多个 fold ensemble 可以写：
+多折：
 
 ```python
 CHECKPOINT_PATHS = [
@@ -121,81 +83,60 @@ CHECKPOINT_PATHS = [
 ]
 ```
 
-## 6. 检查提交文件
+注意：同一个 ensemble 里的 checkpoint 必须使用相同 `spec_mode`，例如都为 `logmel_pcen`。
 
-脚本运行完成后，在 Notebook 新开一格：
+## 5. 加 sidecar CSV
+
+编辑脚本顶部：
+
+```python
+SIDECAR_CSV_PATHS = [
+    "/kaggle/input/birdclef2026-weights/subm_birdnet_v24.csv",
+]
+SIDECAR_WEIGHTS = [0.03]
+```
+
+默认 sidecar 参数比较保守：
+
+```python
+SIDECAR_RANK_BLEND = True
+SIDECAR_TOPK = 48
+SIDECAR_BUDGET = 0.006
+```
+
+sidecar CSV 必须包含 `row_id` 和所有物种列，列名要与 `sample_submission.csv` 一致。
+
+## 6. 后处理参数
+
+脚本顶部默认：
+
+```python
+TAX_GENUS_ALPHA = 0.15
+TAX_CLASS_ALPHA = 0.05
+TEMPORAL_SMOOTH_ALPHA = 0.15
+```
+
+这些是弱修正。如果线上分数不稳定，可以先设为 `0.0` 做 anchor 对照，再逐个打开。
+
+## 7. 检查 submission
+
+运行完成后：
 
 ```python
 import pandas as pd
-
 sub = pd.read_csv("/kaggle/working/submission.csv")
 print(sub.shape)
 sub.head()
 ```
 
-列数应该是：
+列数应为 `235`。脚本最后会强制按 `sample_submission.csv` 对齐列顺序。
+
+## 8. 正式提交
+
+点击：
 
 ```text
-235
+Save Version -> Save & Run All -> Submit to Competition
 ```
 
-也就是：
-
-```text
-row_id + 234 个物种概率列
-```
-
-## 7. 正式提交
-
-检查 `/kaggle/working/submission.csv` 生成成功后：
-
-1. 点击右上角 `Save Version`
-2. 选择 `Save & Run All`
-3. 等 Kaggle 后台完整跑完
-4. 进入生成的 Notebook Version 页面
-5. 点击 `Submit to Competition`
-
-不要直接上传本地 CSV。这个比赛是隐藏测试集，真实 `test_soundscapes` 只会在 Kaggle 评分时挂载到 Notebook 里。
-
-## 8. 常见问题
-
-### 找不到权重
-
-报错类似：
-
-```text
-No checkpoint found
-```
-
-解决方法：检查 Dataset 路径，然后手动填写 `CHECKPOINT_PATHS`。
-
-### 找不到 timm
-
-报错类似：
-
-```text
-No module named 'timm'
-```
-
-说明 Kaggle 环境没有可用的 `timm`。解决方法是上传一个包含 `timm` wheel 的 Kaggle Dataset，或把 notebook internet 打开安装后再作为自定义镜像流程处理。正式提交时 internet 必须关闭。
-
-### 运行超时
-
-先把脚本顶部改小：
-
-```python
-BATCH_SIZE = 16
-TTA = 0
-```
-
-如果用了多个 fold，先只提交一个 `fold0_best.pt`。EfficientNetV2-S 单 fold 是比较稳的第一版，多个大模型 ensemble 可能超过 CPU 90 分钟。
-
-### 提交列不匹配
-
-脚本最后会强制：
-
-```python
-sub = sub[sample.columns]
-```
-
-只要官方 `sample_submission.csv` 能读取，一般不会列错。不要手动改 species 列顺序。
+不要直接上传本地 CSV。这个比赛的隐藏 `test_soundscapes` 只会在 Kaggle 评分 Notebook 运行时挂载。

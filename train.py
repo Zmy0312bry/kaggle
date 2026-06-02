@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import roc_auc_score
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 import sys
@@ -50,13 +50,14 @@ def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float, p: float) -> tup
     return x * lam + x[index] * (1.0 - lam), y * lam + y[index] * (1.0 - lam)
 
 
-def evaluate(model, loader, device, target_threshold: float = 0.0):
+def evaluate(model, loader, device, use_amp: bool = False, target_threshold: float = 0.0):
     model.eval()
     preds, targets = [], []
     with torch.no_grad():
         for x, y in tqdm(loader, desc="valid", leave=False):
             x = x.to(device)
-            logits = model(x)
+            with torch.amp.autocast(device.type, enabled=use_amp):
+                logits = model(x)
             preds.append(torch.sigmoid(logits).cpu())
             targets.append(y.cpu())
     pred = torch.cat(preds).numpy()
@@ -68,12 +69,28 @@ def evaluate(model, loader, device, target_threshold: float = 0.0):
     return float(sum(aucs) / max(1, len(aucs)))
 
 
+def build_balanced_sampler(df: pd.DataFrame, target_cols: list[str]) -> WeightedRandomSampler:
+    targets = df[target_cols].to_numpy(dtype=np.float32)
+    positives = np.maximum(targets.sum(axis=0), 1.0)
+    class_weight = 1.0 / positives
+    sample_weight = (targets * class_weight).sum(axis=1)
+    sample_weight = np.maximum(sample_weight, np.percentile(sample_weight[sample_weight > 0], 25) if np.any(sample_weight > 0) else 1.0)
+    sample_weight = sample_weight / sample_weight.mean()
+    return WeightedRandomSampler(
+        weights=torch.as_tensor(sample_weight, dtype=torch.double),
+        num_samples=len(sample_weight),
+        replacement=True,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--meta-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/exp001"))
     parser.add_argument("--model", default="tf_efficientnetv2_s.in21k_ft_in1k")
+    parser.add_argument("--pretrained-path", type=Path, default=None,
+                        help="本地预训练 backbone 权重路径（避免从网络下载）")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -81,9 +98,11 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--duration", type=float, default=8.0)
+    parser.add_argument("--spec-mode", choices=["logmel", "pcen", "logmel_pcen"], default="logmel",
+                        help="Audio frontend. logmel_pcen creates a two-channel input inspired by PCEN sidecars.")
     parser.add_argument("--loss", choices=["bce", "asymmetric"], default="asymmetric")
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--pooling", choices=["avg", "max", "avgmax", "gem"], default="gem")
+    parser.add_argument("--pooling", choices=["avg", "max", "avgmax", "gem", "attn"], default="attn")
     parser.add_argument("--head-hidden", type=int, default=512)
     parser.add_argument("--drop-path", type=float, default=0.1)
     parser.add_argument("--mixup-alpha", type=float, default=0.3)
@@ -98,17 +117,39 @@ def main() -> None:
     parser.add_argument("--clip-grad", type=float, default=1.0)
     parser.add_argument("--eval-target-threshold", type=float, default=0.0, help="Binarize soft labels before ROC-AUC.")
     parser.add_argument("--include-soundscapes", action="store_true", help="Add labeled 5-second soundscape rows to the training split.")
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--balanced-sampler", action="store_true",
+                        help="Sample rare positive classes more often. Useful for macro-AUC on long-tail taxa.")
+    parser.add_argument("--use-precomputed", action="store_true",
+                        help="使用预计算频谱 .npy 缓存（需先运行 scripts/precompute_spectrograms.py）")
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=4,
+                        help="DataLoader prefetch_factor，每个 worker 预取 batch 数")
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision training.")
     parser.add_argument("--channels-last", action="store_true", help="Use channels-last tensors on CUDA for speed/memory.")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile (PyTorch>=2.0) for faster forward/backward.")
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     species = load_json(args.meta_dir / "species_list.json")
-    manifest = pd.read_csv(args.meta_dir / "train_manifest.csv")
+
+    # 预计算模式：自动使用带 spec_path 的 manifest
+    if args.use_precomputed:
+        precomputed_manifest = args.meta_dir / "train_manifest_precomputed.csv"
+        if precomputed_manifest.exists():
+            manifest = pd.read_csv(precomputed_manifest)
+            print(f"Using precomputed manifest: {precomputed_manifest}")
+        else:
+            manifest = pd.read_csv(args.meta_dir / "train_manifest.csv")
+            print("Warning: --use-precomputed but precomputed manifest not found, using original.")
+    else:
+        manifest = pd.read_csv(args.meta_dir / "train_manifest.csv")
     train_df = manifest[manifest["fold"] != args.fold].reset_index(drop=True)
     valid_df = manifest[manifest["fold"] == args.fold].reset_index(drop=True)
     soundscape_manifest = args.meta_dir / "soundscape_manifest.csv"
+    if args.use_precomputed:
+        precomputed_soundscape = args.meta_dir / "soundscape_manifest_precomputed.csv"
+        if precomputed_soundscape.exists():
+            soundscape_manifest = precomputed_soundscape
     if args.include_soundscapes and soundscape_manifest.exists():
         sound_df = pd.read_csv(soundscape_manifest)
         sound_df["num_samples"] = 5 * 32000
@@ -119,21 +160,33 @@ def main() -> None:
         train_df,
         duration=args.duration,
         train=True,
+        use_precomputed=args.use_precomputed,
+        spec_mode=args.spec_mode,
         spec_augment_p=args.spec_augment_p,
         time_mask_width=args.time_mask_width,
         freq_mask_width=args.freq_mask_width,
     )
-    valid_ds = BirdCLEFDataset(valid_df, duration=5.0, train=False)
+    valid_ds = BirdCLEFDataset(
+        valid_df,
+        duration=5.0,
+        train=False,
+        use_precomputed=args.use_precomputed,
+        spec_mode=args.spec_mode,
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pin_memory = device.type == "cuda"
     persistent_workers = args.num_workers > 0
+    target_cols = [c for c in train_df.columns if c.startswith("target_")]
+    sampler = build_balanced_sampler(train_df, target_cols) if args.balanced_sampler else None
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
     valid_loader = DataLoader(
         valid_ds,
@@ -142,17 +195,23 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
 
     model = BirdCLEFModel(
         args.model,
         num_classes=len(species),
-        pretrained=True,
+        pretrained=args.pretrained_path is None,
+        pretrained_path=str(args.pretrained_path) if args.pretrained_path else None,
         dropout=args.dropout,
         pooling=args.pooling,
         head_hidden=args.head_hidden,
         drop_path_rate=args.drop_path,
+        in_chans=2 if args.spec_mode == "logmel_pcen" else 1,
     ).to(device)
+    if args.compile and hasattr(torch, "compile"):
+        model = torch.compile(model, mode="reduce-overhead")
+        print("torch.compile enabled (reduce-overhead)")
     if args.channels_last and device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
     criterion = AsymmetricLoss() if args.loss == "asymmetric" else torch.nn.BCEWithLogitsLoss()
@@ -177,6 +236,7 @@ def main() -> None:
         f"model={args.model} pooling={args.pooling} head_hidden={args.head_hidden} "
         f"batch_size={args.batch_size} grad_accum={grad_accum} effective_batch={args.batch_size * grad_accum} "
         f"amp={use_amp} mixup={args.mixup_alpha}/{args.mixup_p} specaug={args.spec_augment_p} "
+        f"spec_mode={args.spec_mode} balanced_sampler={args.balanced_sampler} "
         f"scheduler={args.scheduler} ema={ema is not None}"
     )
 
@@ -208,7 +268,7 @@ def main() -> None:
             total_loss += float(loss.detach().cpu()) * grad_accum
 
         eval_model = ema.module if ema is not None else model
-        auc = evaluate(eval_model, valid_loader, device, target_threshold=args.eval_target_threshold)
+        auc = evaluate(eval_model, valid_loader, device, use_amp=use_amp, target_threshold=args.eval_target_threshold)
         current_lr = optimizer.param_groups[0]["lr"]
         print(f"epoch={epoch} train_loss={total_loss / max(1, len(train_loader)):.5f} val_macro_auc={auc:.5f} lr={current_lr:.2e}")
         ckpt = {
@@ -222,6 +282,8 @@ def main() -> None:
             "head_hidden": args.head_hidden,
             "drop_path": args.drop_path,
             "duration": args.duration,
+            "spec_mode": args.spec_mode,
+            "in_chans": 2 if args.spec_mode == "logmel_pcen" else 1,
         }
         torch.save(ckpt, args.out_dir / f"fold{args.fold}_last.pt")
         if auc > best_auc:

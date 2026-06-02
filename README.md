@@ -1,40 +1,70 @@
-# BirdCLEF+ 2026 Kaggle Starter
+# BirdCLEF+ 2026 Kaggle Pipeline
 
-This folder contains a practical starter pipeline for the Kaggle BirdCLEF+ 2026 competition.
+This project is a stronger BirdCLEF+ 2026 training and submission pipeline. It now follows the public high-score pattern more closely: a solid PyTorch anchor model, PCEN/log-mel audio features, event-aware pooling, in-domain soundscape training, taxonomy smoothing, temporal smoothing, and optional Perch/BirdNET-style sidecar CSV blending.
 
-The competition is a 5-second-window, multi-label bioacoustic classification task. The hidden test set is populated only when the Kaggle submission notebook runs, so the final notebook must work offline and write `/kaggle/working/submission.csv`.
+## What Changed
 
-## Files
+- Audio frontend supports `logmel`, `pcen`, and `logmel_pcen`.
+- `logmel_pcen` uses two input channels, inspired by PCEN/ConvNeXt sidecar notebooks.
+- Model pooling now supports `attn`, which combines attention-weighted features with peak features for short acoustic events.
+- Training supports rare-class `--balanced-sampler`.
+- `infer.py` reads `spec_mode` and `in_chans` from checkpoints automatically.
+- Inference supports sidecar submission CSVs, rank-space blending, taxonomy smoothing, and temporal smoothing.
+- `kaggle_submission_standalone.py` was rebuilt so Kaggle CPU submission uses the same inference logic.
 
-- `docs/strategy.md` - competition reading notes, research-backed scoring strategy, and ablation roadmap.
-- `docs/ai_handoff.md` - compact instructions for another AI/engineer to continue the work.
-- `docs/中文运行与提交指南.md` - Chinese local GPU training and Kaggle submission guide.
-- `scripts/download_data.py` - standalone data download script using `kagglehub`.
-- `scripts/check_gpu.py` - quick PyTorch CUDA check for local training.
-- `scripts/prepare_metadata.py` - parses the Kaggle CSV files into train/soundscape manifests and folds.
-- `train.py` - trains a mel-spectrogram image model with multi-label BCE or asymmetric loss.
-- `infer.py` - CPU-friendly Kaggle inference script that builds `submission.csv`.
-- `src/birdclef2026/` - reusable dataset, audio, model, and utility code.
-
-## Local Quick Start
+## Setup
 
 ```bash
 cd birdclef2026
 python scripts/download_data.py --out data/birdclef-2026 --copy
 python scripts/prepare_metadata.py --data-dir data/birdclef-2026 --out-dir data/processed
 python scripts/check_gpu.py
-python train.py --data-dir data/birdclef-2026 --meta-dir data/processed --out-dir outputs/exp001 --epochs 8 --fold 0 --batch-size 8 --grad-accum 2 --duration 8 --channels-last
-python infer.py --data-dir data/birdclef-2026 --checkpoint outputs/exp001/fold0_best.pt --out submission.csv
 ```
 
-## Stronger Local Training Recipe
+## Strong Anchor Training
 
-For an RTX 3060 Laptop GPU, start with EfficientNetV2-S plus in-domain soundscapes, mixup, SpecAugment, EMA, and cosine LR scheduling:
+Start with one fold and validate the pipeline:
 
 ```bash
-python train.py --data-dir data/birdclef-2026 --meta-dir data/processed --out-dir outputs/effv2s_fold0 --model tf_efficientnetv2_s.in21k_ft_in1k --epochs 12 --fold 0 --batch-size 8 --grad-accum 2 --duration 10 --channels-last --include-soundscapes --pooling gem --head-hidden 512 --drop-path 0.1 --mixup-alpha 0.3 --mixup-p 0.5 --spec-augment-p 0.5 --scheduler cosine
+python train.py --data-dir data/birdclef-2026 --meta-dir data/processed --out-dir outputs/anchor_v2_fold0 --model convnext_tiny.fb_in22k_ft_in1k --epochs 12 --fold 0 --batch-size 8 --grad-accum 2 --duration 10 --channels-last --include-soundscapes --spec-mode logmel_pcen --pooling attn --head-hidden 512 --drop-path 0.1 --balanced-sampler --mixup-alpha 0.3 --mixup-p 0.5 --spec-augment-p 0.5 --scheduler cosine
 ```
 
-If memory is still comfortable, try `--batch-size 12 --grad-accum 1` or `--batch-size 16 --grad-accum 1`. Keep the final Kaggle inference model small enough to finish CPU scoring within 90 minutes; one EfficientNetV2-S fold is a reasonable first stronger submission.
+If VRAM is tight, use EfficientNet-B0 and shorter clips:
 
-On Kaggle, attach the competition dataset and your trained weights dataset, then run `infer.py` from a notebook or paste its cells into a Kaggle Code notebook.
+```bash
+python train.py --data-dir data/birdclef-2026 --meta-dir data/processed --out-dir outputs/anchor_v2_small_fold0 --model tf_efficientnet_b0_ns --epochs 10 --fold 0 --batch-size 8 --grad-accum 2 --duration 8 --channels-last --include-soundscapes --spec-mode logmel_pcen --pooling attn --head-hidden 256 --balanced-sampler
+```
+
+Train 2-5 folds only after a single fold produces a valid submission and fits the CPU budget.
+
+## Local Inference
+
+Plain anchor inference:
+
+```bash
+python infer.py --data-dir data/birdclef-2026 --checkpoint outputs/anchor_v2_fold0/fold0_best.pt --out submission.csv --tax-genus-alpha 0.15 --tax-class-alpha 0.05 --temporal-smooth-alpha 0.15
+```
+
+With a Perch/BirdNET/other sidecar CSV:
+
+```bash
+python infer.py --data-dir data/birdclef-2026 --checkpoint outputs/anchor_v2_fold0/fold0_best.pt --out submission.csv --sidecar-csv subm_birdnet_v24.csv --sidecar-weight 0.03 --sidecar-rank-blend --sidecar-topk 48 --sidecar-budget 0.006 --tax-genus-alpha 0.15 --tax-class-alpha 0.05 --temporal-smooth-alpha 0.15
+```
+
+The sidecar CSV must have `row_id` plus the same species columns as `sample_submission.csv`.
+
+## Kaggle Submission
+
+Upload these files to a Kaggle Dataset:
+
+- `kaggle_submission_standalone.py`
+- `fold*_best.pt`
+- optional sidecar CSVs if you generated them
+
+In the Kaggle notebook, attach the competition data and your weights dataset, turn internet off, use CPU, then run:
+
+```python
+!python /kaggle/input/birdclef2026-weights/kaggle_submission_standalone.py
+```
+
+Edit the constants at the top of `kaggle_submission_standalone.py` if the checkpoint paths or sidecar paths need to be fixed manually.
