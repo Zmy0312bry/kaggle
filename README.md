@@ -21,12 +21,28 @@ python scripts/prepare_metadata.py --data-dir data/birdclef-2026 --out-dir data/
 python scripts/check_gpu.py
 ```
 
+## Download Model Assets
+
+For the strongest current anchor, download the ConvNeXt-Base timm backbone and the Google Perch v2 CPU Kaggle model:
+
+```bash
+python scripts/download_model.py --preset anchor_v2_strong
+```
+
+This creates:
+
+- `models/pretrained/convnext_base.fb_in22k_ft_in1k.pth`
+- `models/kaggle/...perch_v2_cpu...`
+- `models/model_assets.json`
+
+Perch is a TensorFlow/Kaggle model. Use it as a teacher, embedding model, or sidecar CSV source; do not pass it to `train.py --pretrained-path`.
+
 ## Strong Anchor Training
 
 Start with one fold and validate the pipeline:
 
 ```bash
-python train.py --data-dir data/birdclef-2026 --meta-dir data/processed --out-dir outputs/anchor_v2_fold0 --model convnext_tiny.fb_in22k_ft_in1k --epochs 12 --fold 0 --batch-size 8 --grad-accum 2 --duration 10 --channels-last --include-soundscapes --spec-mode logmel_pcen --pooling attn --head-hidden 512 --drop-path 0.1 --balanced-sampler --mixup-alpha 0.3 --mixup-p 0.5 --spec-augment-p 0.5 --scheduler cosine
+python train.py --data-dir data/birdclef-2026 --meta-dir data/processed --out-dir outputs/anchor_v2_convnext_base_fold0 --model convnext_base.fb_in22k_ft_in1k --pretrained-path models/pretrained/convnext_base.fb_in22k_ft_in1k.pth --epochs 20 --fold 0 --batch-size 4 --grad-accum 4 --duration 10 --channels-last --include-soundscapes --spec-mode logmel_pcen --pooling attn --head-hidden 768 --drop-path 0.2 --balanced-sampler --mixup-alpha 0.3 --mixup-p 0.5 --spec-augment-p 0.5 --scheduler cosine --lr 1e-4 --weight-decay 1e-4
 ```
 
 If VRAM is tight, use EfficientNet-B0 and shorter clips:

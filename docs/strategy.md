@@ -69,9 +69,15 @@ The current anchor is no longer just a plain mel-spectrogram classifier. It is a
 Good starting configs:
 
 ```bash
-python train.py --data-dir data/birdclef-2026 --meta-dir data/processed --out-dir outputs/anchor_v2_small_fold0 --model tf_efficientnet_b0_ns --epochs 10 --fold 0 --batch-size 8 --grad-accum 2 --duration 8 --include-soundscapes --spec-mode logmel_pcen --pooling attn --head-hidden 256 --balanced-sampler
-python train.py --data-dir data/birdclef-2026 --meta-dir data/processed --out-dir outputs/anchor_v2_fold0 --model convnext_tiny.fb_in22k_ft_in1k --epochs 12 --fold 0 --batch-size 8 --grad-accum 2 --duration 10 --channels-last --include-soundscapes --spec-mode logmel_pcen --pooling attn --head-hidden 512 --drop-path 0.1 --balanced-sampler --scheduler cosine
+python scripts/download_model.py --preset anchor_v2_strong
+python train.py --data-dir data/birdclef-2026 --meta-dir data/processed --out-dir outputs/anchor_v2_convnext_base_fold0 --model convnext_base.fb_in22k_ft_in1k --pretrained-path models/pretrained/convnext_base.fb_in22k_ft_in1k.pth --epochs 20 --fold 0 --batch-size 4 --grad-accum 4 --duration 10 --channels-last --include-soundscapes --spec-mode logmel_pcen --pooling attn --head-hidden 768 --drop-path 0.2 --balanced-sampler --scheduler cosine --lr 1e-4
 ```
+
+Perch v2 CPU note:
+
+- `google/bird-vocalization-classifier/TensorFlow2/perch_v2_cpu` is a TensorFlow/Kaggle Model.
+- It should not be loaded through `BirdCLEFModel` or `--pretrained-path`.
+- Use it as a teacher/embedding model or as a sidecar CSV source. The existing `infer.py` sidecar rank blend is the intended integration point.
 
 ## High-Score Roadmap
 

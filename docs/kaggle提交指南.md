@@ -30,6 +30,14 @@ subm_birdnet_v24.csv
 subm_perch.csv
 ```
 
+如果你用 `scripts/download_model.py --preset anchor_v2_strong` 下载了 Google Perch v2 CPU，本地会有 `models/kaggle/...`。正式 Kaggle 提交时更推荐直接在 Notebook 的 Add Input 里添加 Kaggle Model：
+
+```text
+google/bird-vocalization-classifier/TensorFlow2/perch_v2_cpu
+```
+
+它不是 PyTorch checkpoint，不能替代 `fold*_best.pt`。它适合作为外部 teacher/sidecar 资产。
+
 ## 2. standalone 脚本包含什么
 
 `kaggle_submission_standalone.py` 已经合并了新版核心逻辑：
@@ -44,7 +52,28 @@ subm_perch.csv
 
 所以 Kaggle 上不需要再复制 `src/` 目录。
 
-## 3. Kaggle Notebook 设置
+## 3. 模型资产下载脚本
+
+本地或服务器上可以先运行：
+
+```bash
+python scripts/download_model.py --preset anchor_v2_strong
+```
+
+这个 preset 会下载：
+
+- `convnext_base.fb_in22k_ft_in1k` 的 timm 预训练 backbone
+- Google Perch v2 CPU Kaggle Model
+
+训练时使用的是 timm `.pth`：
+
+```bash
+python train.py --model convnext_base.fb_in22k_ft_in1k --pretrained-path models/pretrained/convnext_base.fb_in22k_ft_in1k.pth ...
+```
+
+Perch 的输出如果整理成 submission CSV，再通过 `--sidecar-csv` 或 standalone 顶部的 `SIDECAR_CSV_PATHS` 融合。
+
+## 4. Kaggle Notebook 设置
 
 新建 Notebook，Add Input：
 
@@ -64,7 +93,7 @@ Internet: Off
 !python /kaggle/input/birdclef2026-weights/kaggle_submission_standalone.py
 ```
 
-## 4. 手动指定权重
+## 5. 手动指定权重
 
 如果自动搜索权重不符合预期，改脚本顶部：
 
@@ -85,7 +114,7 @@ CHECKPOINT_PATHS = [
 
 注意：同一个 ensemble 里的 checkpoint 必须使用相同 `spec_mode`，例如都为 `logmel_pcen`。
 
-## 5. 加 sidecar CSV
+## 6. 加 sidecar CSV
 
 编辑脚本顶部：
 
@@ -106,7 +135,7 @@ SIDECAR_BUDGET = 0.006
 
 sidecar CSV 必须包含 `row_id` 和所有物种列，列名要与 `sample_submission.csv` 一致。
 
-## 6. 后处理参数
+## 7. 后处理参数
 
 脚本顶部默认：
 
@@ -118,7 +147,7 @@ TEMPORAL_SMOOTH_ALPHA = 0.15
 
 这些是弱修正。如果线上分数不稳定，可以先设为 `0.0` 做 anchor 对照，再逐个打开。
 
-## 7. 检查 submission
+## 8. 检查 submission
 
 运行完成后：
 
@@ -131,7 +160,7 @@ sub.head()
 
 列数应为 `235`。脚本最后会强制按 `sample_submission.csv` 对齐列顺序。
 
-## 8. 正式提交
+## 9. 正式提交
 
 点击：
 
